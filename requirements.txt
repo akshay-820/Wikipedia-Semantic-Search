@@ -1,0 +1,14 @@
+mwclient
+pandas
+gradio
+scikit-learn
+numpy
+openai
+python-dotenv
+tiktoken
+wikipedia
+requests
+typing-extensions
+lxml
+beautifulsoup4
+structlog
