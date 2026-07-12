@@ -12,3 +12,4 @@ typing-extensions
 lxml
 beautifulsoup4
 structlog
+google-genai

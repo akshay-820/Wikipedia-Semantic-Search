@@ -5,24 +5,27 @@ import os
 import logging
 from sklearn.metrics.pairwise import cosine_similarity
 import gradio as gr
-from openai import OpenAI
+from google import genai
 from dotenv import load_dotenv
 from wiki_loader import fetch_wikipedia_articles, save_metadata, search_wikipedia_articles, fetch_wikipedia_articles_from_titles
 from text_processor import process_sections
-from embedding_generator import generate_and_save_embeddings, generate_embeddings
+from embedding_generator import generate_embeddings
 from functools import lru_cache
 import re
 import wikipedia
-from bs4 import BeautifulSoup
 import structlog
 import time
 import traceback
+import mwparserfromhell
+
+# FIX: Set unique User-Agent to comply with Wikipedia API rules and prevent 429/JSONDecodeError
+wikipedia.set_user_agent("SemanticSearchApp/1.0 (contact:akshay@example.com)")
 
 load_dotenv()
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Initialize Gemini client
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-# Configure structured logging
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
@@ -36,18 +39,14 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-def _wiki_request(*args, **kwargs):
-    """Monkey patch for Wikipedia's _wiki_request to use lxml parser"""
-    html = wikipedia._wiki_request(*args, **kwargs)
-    if isinstance(html, str):
-        return BeautifulSoup(html, 'lxml')
-    return html
-
-wikipedia._wiki_request = _wiki_request
-
 @lru_cache(maxsize=100)
 def get_embeddings(query: str) -> list[float]:
-    return generate_embeddings([query])[0]
+    """Retrieves embedding vector for the single incoming search string."""
+    response = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=query
+    )
+    return response.embeddings[0].values
 
 def load_embeddings(embeddings_file: str) -> pd.DataFrame:
     """Loads embeddings from a CSV file."""
@@ -57,7 +56,6 @@ def load_embeddings(embeddings_file: str) -> pd.DataFrame:
             return pd.DataFrame(columns=['text', 'embedding'])
         
         df = pd.read_csv(embeddings_file)
-        # Convert string representation of embeddings back to list
         df['embedding'] = df['embedding'].apply(lambda x: list(map(float, x.strip('[]').split(','))))
         return df
     except Exception as e:
@@ -81,36 +79,23 @@ def search_embeddings(
     metadata: pd.DataFrame,
     top_k: int = 5
 ) -> pd.DataFrame:
-    """
-    Finds the top_k most similar embeddings using cosine similarity.
-    Returns the corresponding metadata and similarity scores.
-    """
+    """Finds the top_k most similar embeddings using cosine similarity."""
     try:
-        # Ensure query_embedding is 2D
         if len(query_embedding.shape) == 1:
             query_embedding = query_embedding.reshape(1, -1)
         
-        # Convert embeddings from list to numpy array for calculation
         embeddings = np.vstack(embeddings_df['embedding'].tolist())
-        
-        # Perform similarity calculation
         similarity_scores = cosine_similarity(query_embedding, embeddings)[0]
         
-        # Handle empty results
         if len(similarity_scores) == 0:
-            return pd.DataFrame()  # Return empty DataFrame if no results
+            return pd.DataFrame()
             
-        # Ensure we don't request more results than we have
         top_k = min(top_k, len(similarity_scores))
-        
-        # Get indices of top k scores
         top_indices = similarity_scores.argsort()[::-1][:top_k]
         top_scores = similarity_scores[top_indices]
         
-        # Create results DataFrame from embeddings_df first
         results = embeddings_df.iloc[top_indices].copy()
         
-        # Add metadata columns if they exist
         if not metadata.empty:
             for col in metadata.columns:
                 if len(metadata) > max(top_indices):
@@ -118,10 +103,9 @@ def search_embeddings(
         
         results['similarity_score'] = top_scores
         return results
-        
     except Exception as e:
         logger.error(f"Error in search_embeddings: {str(e)}")
-        raise  # Re-raise the exception to see the full traceback
+        raise
 
 def format_results(results_df):
     """Enhanced results formatting with better readability and metadata."""
@@ -142,95 +126,87 @@ def format_results(results_df):
     return {"results": formatted_results, "total_count": len(formatted_results)}
 
 def clean_wiki_text(text: str) -> str:
-    """Remove Wikipedia template tags and clean up the text."""
-    # Remove template tags {{...}}
-    text = re.sub(r'\{\{[^}]+\}\}', '', text)
-    # Remove extra whitespace
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    """Strip Wikipedia markup (templates, links, files, refs) down to plain readable text."""
+    wikicode = mwparserfromhell.parse(text)
 
-def format_wiki_results(status: str, articles: list) -> tuple[str, dict, str]:
-    if not articles:
-        return status, {"results": []}, ""
-        
-    formatted_articles = []
-    for article in articles:
-        # Get summary and clean it
-        summary = article.get('summary', '')
-        cleaned_summary = clean_wiki_text(summary)
-        
-        formatted_articles.append({
-            "title": article['title'],
-            "url": article['url'],
-            "summary": cleaned_summary[:200] + "..." if cleaned_summary else "",
-            "relevance": "High"  # Add relevance indicator
-        })
-    
-    return status, {"results": formatted_articles}, ""
+    for template in wikicode.filter_templates(recursive=False):
+        try:
+            wikicode.remove(template)
+        except ValueError:
+            pass  # already removed as part of a parent node
+
+    for link in wikicode.filter_wikilinks(recursive=False):
+        if link.title.strip().lower().startswith(('file:', 'image:')):
+            try:
+                wikicode.remove(link)
+            except ValueError:
+                pass
+
+    plain = wikicode.strip_code()
+    plain = re.sub(r'<ref.*?</ref>', '', plain, flags=re.DOTALL)
+    plain = re.sub(r'\s+', ' ', plain)
+    return plain.strip()
 
 try:
-    # Add directory creation
     os.makedirs('data/embeddings', exist_ok=True)
     os.makedirs('data/metadata', exist_ok=True)
     
-    # Load data
     logger.info("Loading embeddings and metadata...")
     embeddings_file = 'data/embeddings/embeddings.csv'
     metadata_file = 'data/metadata.csv'
     
-    # Initialize with empty arrays if no data exists
     embeddings_df = load_embeddings(embeddings_file)
     metadata = load_metadata(metadata_file)
-    
-    if embeddings_df.empty:
-        logger.info("No existing embeddings found. System will create new embeddings on first search.")
-    else:
-        logger.info(f"Loaded embeddings and metadata successfully")
 
 except Exception as e:
     logger.error(f"Initialization failed: {str(e)}")
     raise
 
-def search_wikipedia(query: str, top_k: int = 5) -> tuple[str, list[dict]]:
-    """Searches Wikipedia for articles related to the query."""
+def search_wikipedia(query: str, top_k: int = 5) -> tuple[str, pd.DataFrame]:
+    global embeddings_df, metadata
     start_time = time.time()
-    logger.info("search_started", 
-                query=query, 
-                top_k=top_k,
-                timestamp=time.time())
+    logger.info("search_started", query=query, top_k=top_k, timestamp=time.time())
+    
     try:
-        # Search for articles
+        logger.info("Gathering live articles to embed via Gemini...")
         search_results = search_wikipedia_articles(query, limit=top_k)
-        if not search_results:
-            logger.info("No results found for query: %s", query)
-            return "No results found.", []
+        if search_results:
+            article_titles = [art['title'] for art in search_results]
+            articles = fetch_wikipedia_articles_from_titles(article_titles)
+            
+            texts, titles, urls = [], [], []
+            for art in articles:
+                try:
+                    clean_text = clean_wiki_text(art.get('summary', ''))
+                    if clean_text:
+                        texts.append(clean_text)
+                        titles.append(art['title'])
+                        urls.append(art['url'])
+                except Exception as e:
+                    logger.warning("skipping_article", title=art.get('title'), error=str(e))
+                    continue
+            
+            if texts:
+                vectors = generate_embeddings(texts)
+                embeddings_df = pd.DataFrame({'text': texts, 'embedding': vectors})
+                metadata = pd.DataFrame({'title': titles, 'url': urls})
 
-        # Fetch full articles
-        article_titles = [article['title'] for article in search_results]
-        articles = fetch_wikipedia_articles_from_titles(article_titles)
-        
+        if embeddings_df.empty:
+            return "No text corpus available to process semantic lookup.", pd.DataFrame()
+
+        query_embedding = np.array(get_embeddings(query))
+        results_df = search_embeddings(query_embedding, embeddings_df, metadata, top_k=top_k)
         duration = time.time() - start_time
-        logger.info("search_completed",
-                   query=query,
-                   results_count=len(articles),
-                   duration=duration)
         
-        return f"Found {len(articles)} results in {duration:.2f} seconds", articles
+        return f"Found {len(results_df)} semantic matches in {duration:.2f} seconds", results_df
 
     except Exception as e:
-        logger.error("search_failed",
-                    query=query,
-                    error=str(e),
-                    traceback=traceback.format_exc())
-        return f"Error: {str(e)}", []
+        logger.error("search_failed", query=query, error=str(e), traceback=traceback.format_exc())
+        return f"Error: {str(e)}", pd.DataFrame()
 
 def create_gradio_interface():
     with gr.Blocks(theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# Semantic Wikipedia Search")
-        
-        # State variables for progress updates
-        status_message = gr.State("")
-        is_processing = gr.State(False)
+        gr.Markdown("# Semantic Wikipedia Search (Powered by Gemini)")
         
         with gr.Row():
             with gr.Column(scale=3):
@@ -239,14 +215,9 @@ def create_gradio_interface():
                     placeholder="Enter your search query here...",
                     lines=3
                 )
-                
             with gr.Column(scale=1):
                 num_results = gr.Slider(
-                    minimum=1,
-                    maximum=10,
-                    value=5,
-                    step=1,
-                    label="Number of Results"
+                    minimum=1, maximum=10, value=5, step=1, label="Number of Results"
                 )
                 
         with gr.Row():
@@ -255,108 +226,36 @@ def create_gradio_interface():
             
         with gr.Accordion("Advanced Options", open=False):
             similarity_threshold = gr.Slider(
-                minimum=0.0,
-                maximum=1.0,
-                value=0.7,
-                label="Similarity Threshold"
+                minimum=0.0, maximum=1.0, value=0.7, label="Similarity Threshold"
             )
         
-        # Progress and status indicators
-        with gr.Row():
-            status_box = gr.Textbox(
-                label="Status",
-                value="Ready",
-                interactive=False
-            )
-            
-        # Progress tracking
-        progress_tracker = gr.Textbox(
-            label="Progress",
-            value="",
-            interactive=False,
-            visible=False
-        )
-            
-        # Results area
-        with gr.Row():
-            output_box = gr.JSON(label="Search Results")
-            
-        # Error messages area
-        error_box = gr.Textbox(
-            label="Errors",
-            visible=False,
-            interactive=False
-        )
+        status_box = gr.Textbox(label="Status", value="Ready", interactive=False)
+        output_box = gr.JSON(label="Search Results")
+        error_box = gr.Textbox(label="Errors", visible=False, interactive=False)
 
         def search_with_progress(query, num_results, progress=gr.Progress()):
             try:
-                # Update status
-                progress(0, desc="Initializing search...")
-                status, articles = search_wikipedia(query, top_k=num_results)
+                progress(0, desc="Querying vector space...")
+                status, results_df = search_wikipedia(query, top_k=num_results)
                 
-                # Simulate progress steps (you can replace with actual progress)
-                progress(0.3, desc="Fetching articles...")
-                time.sleep(0.5)  # Simulate processing time
+                if results_df.empty:
+                    return {status_box: status, output_box: {"results": [], "total_count": 0}, error_box: gr.update(visible=False)}
                 
-                progress(0.6, desc="Processing results...")
-                time.sleep(0.5)  # Simulate processing time
-                
-                progress(0.9, desc="Formatting output...")
-                status, results, _ = format_wiki_results(status, articles)
-                
+                progress(0.7, desc="Formatting parameters...")
+                formatted_json = format_results(results_df)
                 progress(1.0, desc="Complete!")
-                return {
-                    status_box: "Search completed",
-                    output_box: results,
-                    error_box: gr.update(visible=False),
-                    progress_tracker: gr.update(visible=False)
-                }
-                
+                return {status_box: status, output_box: formatted_json, error_box: gr.update(visible=False)}
             except Exception as e:
-                error_msg = f"Error during search: {str(e)}"
-                return {
-                    status_box: "Error occurred",
-                    output_box: {"results": []},
-                    error_box: gr.update(visible=True, value=error_msg),
-                    progress_tracker: gr.update(visible=False)
-                }
+                return {status_box: "Error occurred", output_box: {"results": []}, error_box: gr.update(visible=True, value=str(e))}
 
         def clear_outputs():
-            return {
-                query: "",
-                status_box: "Ready",
-                output_box: {"results": []},
-                error_box: gr.update(visible=False),
-                progress_tracker: gr.update(visible=False)
-            }
+            return {query: "", status_box: "Ready", output_box: {"results": []}, error_box: gr.update(visible=False)}
 
-        # Event handlers
-        search_button.click(
-            fn=search_with_progress,
-            inputs=[query, num_results],
-            outputs=[status_box, output_box, error_box, progress_tracker],
-            show_progress=True
-        )
-        
-        clear_button.click(
-            fn=clear_outputs,
-            inputs=[],
-            outputs=[query, status_box, output_box, error_box, progress_tracker]
-        )
-        
-        # Add example queries
-        gr.Examples(
-            examples=[
-                ["What is quantum computing?", 5],
-                ["Explain artificial intelligence", 3],
-                ["History of space exploration", 4]
-            ],
-            inputs=[query, num_results]
-        )
+        search_button.click(fn=search_with_progress, inputs=[query, num_results], outputs=[status_box, output_box, error_box], show_progress=True)
+        clear_button.click(fn=clear_outputs, outputs=[query, status_box, output_box, error_box])
         
         return demo
 
 if __name__ == "__main__":
-    logger.info("Starting Gradio interface...")
     iface = create_gradio_interface()
     iface.launch(share=False)
